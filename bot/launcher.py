@@ -26,37 +26,28 @@ class SessionData(NamedTuple):
 
 
 def get_session_names() -> list[str]:
-    return [file.stem for file in sorted(Path("sessions").glob("*.session"))]
-
-
-async def register_sessions() -> None:
-    session_name = input("\nEnter the session name (press Enter to exit): ")
-    if not session_name:
-        return
-
-    sessions_path = Path("sessions")
-    if not sessions_path.exists():
-        sessions_path.mkdir()
-
-    session = Client(
-        name=session_name,
-        api_id=config.API_ID,
-        api_hash=config.API_HASH,
-        workdir="sessions/",
-    )
-
-    async with session:
-        user_data = await session.get_me()
-    log.success(
-        f"Session added successfully: {user_data.username or user_data.id} | "
-        f"{user_data.first_name or ''} {user_data.last_name or ''}"
+    # 按照session文件名的数值部分排序
+    return sorted(
+        [file.stem for file in Path("sessions").glob("*.session")],
+        key=lambda name: int(name)  # 假设文件名为纯数字，比如 1.session
     )
 
 
-def get_proxies() -> [str | None]:
+def get_proxies() -> list[str | None]:
     if config.USE_PROXY_FROM_FILE:
         with Path("proxies.txt").open(encoding="utf-8") as file:
-            return [Proxy.from_str(proxy=row.strip()).as_url for row in file if row.strip()]
+            proxies = []
+            for row in file:
+                proxy = row.strip()
+                try:
+                    # 提取IP地址和端口号部分
+                    ip_port = proxy.split('@')[-1]
+                    ip, port = ip_port.split(':')
+                    port = int(port)  # 确保端口是整数
+                    proxies.append(Proxy.from_str(proxy=proxy).as_url)
+                except (ValueError, IndexError) as e:
+                    log.warning(f"Invalid proxy format detected and skipped: {proxy} - {str(e)}")
+            return proxies
     return None
 
 
@@ -83,22 +74,30 @@ async def get_tg_clients() -> list[SessionData]:
 
 async def run_bot_with_delay(tg_client: Client, proxy: str | None, additional_data: dict) -> None:
     delay = random.randint(*config.SLEEP_BETWEEN_START)
-    log.bind(session_name=tg_client.name).info(f"Wait {delay} seconds before start")
+    bound_logger = log.bind(session_name=tg_client.name, proxy=str(proxy))
+    bound_logger.info(f"Wait {delay} seconds before start with proxy: {proxy}")
     await asyncio.sleep(delay)
     await run_bot(tg_client=tg_client, proxy=proxy, additional_data=additional_data)
 
 
 async def run_clients(session_data: list[SessionData]) -> None:
-    proxies = get_proxies() or [None]
-    if config.ADD_LOCAL_MACHINE_AS_IP:
-        proxies.append(None)
-    proxy_cycle = cycle(proxies)
-    await asyncio.gather(
-        *[
-            run_bot_with_delay(tg_client=s_data.tg_client, proxy=next(proxy_cycle), additional_data=s_data.session_data)
-            for s_data in session_data
-        ]
-    )
+    proxies = get_proxies()
+    
+    if not proxies:
+        log.error("No proxies found. Exiting.")
+        return
+    
+    if len(proxies) < len(session_data):
+        log.error("Not enough proxies for all sessions. Exiting.")
+        return
+    
+    # 逐一绑定session与代理
+    tasks = []
+    for i, s_data in enumerate(session_data):
+        proxy = proxies[i]
+        tasks.append(run_bot_with_delay(tg_client=s_data.tg_client, proxy=proxy, additional_data=s_data.session_data))
+    
+    await asyncio.gather(*tasks)
 
 
 async def start() -> None:
